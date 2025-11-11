@@ -97,6 +97,16 @@ class CassandraTestUtils {
 
     /**
      * Create a keyspace if it doesn't exist.
+     * Simple method name for convenient usage in tests.
+     *
+     * @param keyspaceName Name of the keyspace
+     */
+    void createKeyspace(String keyspaceName) {
+        createKeyspaceIfNotExists(keyspaceName, 1)
+    }
+
+    /**
+     * Create a keyspace if it doesn't exist.
      *
      * @param keyspaceName Name of the keyspace
      * @param replicationFactor Replication factor

@@ -102,6 +102,14 @@
             <scope>compile</scope>
         </dependency>
 
+        <!-- Azure Cosmos DB SDK -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-cosmos</artifactId>
+            <version>4.60.0</version>
+            <scope>compile</scope>
+        </dependency>
+
         <!-- WireMock -->
         <dependency>
             <groupId>com.github.tomakehurst</groupId>

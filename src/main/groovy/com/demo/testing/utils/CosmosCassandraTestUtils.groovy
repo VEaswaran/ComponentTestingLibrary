@@ -111,6 +111,17 @@ class CosmosCassandraTestUtils {
     }
 
     /**
+     * Create a keyspace in Cosmos DB.
+     * Note: Cosmos DB has limitations on keyspace creation.
+     * This is an alias for createKeyspaceIfNotExists() for API compatibility.
+     *
+     * @param keyspaceName Name of the keyspace
+     */
+    void createKeyspace(String keyspaceName) {
+        createKeyspaceIfNotExists(keyspaceName)
+    }
+
+    /**
      * Create a keyspace in Cosmos DB (if supported by your account).
      * Note: Cosmos DB has limitations on keyspace creation.
      *
