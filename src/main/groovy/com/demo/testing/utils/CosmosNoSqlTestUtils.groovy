@@ -11,7 +11,10 @@ import org.slf4j.LoggerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+import javax.net.ssl.HttpsURLConnection
 import java.security.cert.X509Certificate
+import java.security.SecureRandom
+import java.util.stream.Collectors
 
 /**
  * Utility class for Azure Cosmos DB (NoSQL API) testing operations.
@@ -44,10 +47,10 @@ class CosmosNoSqlTestUtils {
             ] as TrustManager[]
 
             def sslContext = SSLContext.getInstance("SSL")
-            sslContext.init(null, trustAllCerts, new java.security.SecureRandom())
+            sslContext.init(null, trustAllCerts, new SecureRandom())
             SSLContext.setDefault(sslContext)
 
-            javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier { hostname, session -> true }
+            HttpsURLConnection.setDefaultHostnameVerifier { hostname, session -> true }
 
             logger.debug("✅ SSL certificate validation disabled")
         } catch (Exception e) {
@@ -70,6 +73,11 @@ class CosmosNoSqlTestUtils {
     CosmosNoSqlTestUtils(String endpoint, String key) {
         this.endpoint = endpoint
         this.key = key
+
+        // Log initialization
+        logger.info("🔧 CosmosNoSqlTestUtils initialized")
+        logger.info("   Endpoint: {}", endpoint)
+        logger.info("   Key: {}...", key?.take(10) ?: "NULL")
     }
 
     /**
@@ -80,7 +88,29 @@ class CosmosNoSqlTestUtils {
     CosmosClient createClient() {
         if (cosmosClient == null) {
             try {
+                logger.info("========================================")
+                logger.info("🔗 Creating Cosmos NoSQL DB client")
+                logger.info("========================================")
+                logger.info("📍 Endpoint: {}", endpoint)
+                logger.info("🔑 Key: {}...", key?.take(10) ?: "NULL")
+
+                // Validate endpoint
+                if (endpoint == null || endpoint.isEmpty()) {
+                    throw new IllegalArgumentException("❌ Endpoint is NULL or empty")
+                }
+                if (!endpoint.startsWith("https://")) {
+                    throw new IllegalArgumentException("❌ Endpoint must start with https:// - got: ${endpoint}")
+                }
+
+                // Validate key
+                if (key == null || key.isEmpty()) {
+                    throw new IllegalArgumentException("❌ Key is NULL or empty")
+                }
+
+                logger.info("✅ Endpoint and key validation passed")
+
                 // Create SSL context that trusts self-signed certificates (for Emulator)
+                logger.info("🔒 Setting up SSL context for self-signed certificates...")
                 def trustAllCerts = [
                     new X509TrustManager() {
                         X509Certificate[] getAcceptedIssuers() { null }
@@ -90,21 +120,170 @@ class CosmosNoSqlTestUtils {
                 ] as TrustManager[]
 
                 def sslContext = SSLContext.getInstance("TLSv1.2")
-                sslContext.init(null, trustAllCerts, new java.security.SecureRandom())
+                sslContext.init(null, trustAllCerts, new SecureRandom())
+                logger.info("✅ SSL context configured")
 
+                logger.info("🔨 Building CosmosClient...")
                 cosmosClient = new CosmosClientBuilder()
                         .endpoint(endpoint)
                         .key(key)
                         .consistencyLevel(ConsistencyLevel.SESSION)
                         .sslContext(sslContext)
+                        .gatewayMode()  // Use gateway mode for more stable emulator connections
                         .buildClient()
+
+                logger.info("✅ CosmosClient built successfully")
+
+                // Test the connection by reading account properties
+                logger.info("🔍 Testing connection by reading account properties...")
+                def accountProps = cosmosClient.readAccountProperties()
+                logger.info("✅ Connection test successful!")
+                logger.info("   Database Regions: {}", accountProps.readableLocations)
+
+                logger.info("========================================")
                 logger.info("✅ Cosmos NoSQL DB client created: {}", endpoint)
+                logger.info("========================================")
+
+            } catch (IllegalArgumentException iae) {
+                logger.error("❌ Configuration Error: {}", iae.message)
+                logger.error("   Please check your endpoint and key configuration")
+                throw iae
+            } catch (java.net.UnknownHostException e) {
+                logger.error("❌ DNS Resolution Error: {}", e.message)
+                logger.error("   Cannot resolve hostname from endpoint: {}", endpoint)
+                logger.error("   Check if the emulator is running and the endpoint is correct")
+                throw new RuntimeException("Failed to resolve endpoint hostname", e)
+            } catch (java.net.ConnectException e) {
+                logger.error("❌ Connection Refused: {}", e.message)
+                logger.error("   Cannot connect to {}", endpoint)
+                logger.error("   Possible causes:")
+                logger.error("   - Cosmos Emulator container is not running")
+                logger.error("   - Port 8081 is not exposed or mapped")
+                logger.error("   - Firewall is blocking the connection")
+                logger.error("   - Docker network issue")
+                throw new RuntimeException("Cannot connect to Cosmos Emulator at ${endpoint}", e)
+            } catch (javax.net.ssl.SSLException e) {
+                logger.error("❌ SSL Error: {}", e.message)
+                logger.error("   SSL certificate validation failed")
+                logger.error("   This should have been disabled for the emulator")
+                throw new RuntimeException("SSL certificate error - ensure SSL validation is disabled", e)
+            } catch (java.util.concurrent.TimeoutException e) {
+                logger.error("❌ Connection Timeout: {}", e.message)
+                logger.error("   The emulator is not responding within the timeout period")
+                logger.error("   Check if the emulator needs more time to start")
+                throw new RuntimeException("Connection timeout - emulator may still be initializing", e)
             } catch (Exception e) {
-                logger.error("❌ Failed to create Cosmos NoSQL DB client", e)
-                throw new RuntimeException("Failed to create Cosmos NoSQL DB client", e)
+                logger.error("❌ Failed to create Cosmos NoSQL DB client")
+                logger.error("   Error Type: {}", e.class.name)
+                logger.error("   Error Message: {}", e.message)
+                logger.error("   Endpoint: {}", endpoint)
+                logger.error("   Stack trace: ", e)
+
+                // Print diagnostic info
+                logger.error("📋 DIAGNOSTIC INFORMATION:")
+                logger.error("   - Java Version: {}", System.getProperty("java.version"))
+                logger.error("   - OS: {}", System.getProperty("os.name"))
+
+                // Try to test if port is reachable
+                try {
+                    def url = new URL(endpoint)
+                    def host = url.host
+                    def port = url.port == -1 ? 8081 : url.port
+                    logger.error("   - Parsed Host: {}", host)
+                    logger.error("   - Parsed Port: {}", port)
+
+                    def socket = new Socket()
+                    socket.connect(new java.net.InetSocketAddress(host, port), 5000)
+                    socket.close()
+                    logger.error("   - Socket Connection: SUCCESS (port is open)")
+                } catch (Exception socketEx) {
+                    logger.error("   - Socket Connection: FAILED - {}", socketEx.message)
+                }
+
+                throw new RuntimeException("Failed to create Cosmos NoSQL DB client: ${e.message}", e)
             }
         }
         return cosmosClient
+    }
+
+    /**
+     * Test connectivity to the Cosmos DB endpoint
+     * This is useful for diagnosing connection issues before attempting to create a client
+     */
+    void testConnectivity() {
+        logger.info("========================================")
+        logger.info("🔍 Testing connectivity to: {}", endpoint)
+        logger.info("========================================")
+
+        try {
+            def url = new URL(endpoint)
+            def host = url.host
+            def port = url.port == -1 ? 8081 : url.port
+
+            logger.info("📍 Parsed Host: {}", host)
+            logger.info("📍 Parsed Port: {}", port)
+
+            // Test 1: DNS Resolution
+            logger.info("🔍 Test 1: DNS Resolution...")
+            try {
+                def inetAddr = java.net.InetAddress.getByName(host)
+                logger.info("   ✅ DNS resolved {} to {}", host, inetAddr.hostAddress)
+            } catch (Exception dnsEx) {
+                logger.error("   ❌ DNS FAILED: {}", dnsEx.message)
+                logger.error("      Cannot resolve hostname '{}'", host)
+                logger.error("      This is critical - check if emulator host/IP is correct")
+                throw dnsEx
+            }
+
+            // Test 2: Socket Connection (TCP)
+            logger.info("🔍 Test 2: Socket Connection (TCP)...")
+            def socket = null
+            try {
+                socket = new Socket()
+                socket.connect(new java.net.InetSocketAddress(host, port), 10000)
+                logger.info("   ✅ Socket connection SUCCESS to {}:{}", host, port)
+            } catch (Exception socketEx) {
+                logger.error("   ❌ Socket connection FAILED: {}", socketEx.message)
+                logger.error("      Cannot establish TCP connection to {}:{}", host, port)
+                logger.error("      Possible causes:")
+                logger.error("      - Emulator is not running")
+                logger.error("      - Port {} is not open", port)
+                logger.error("      - Firewall is blocking the connection")
+                logger.error("      - Wrong host/IP address")
+                throw socketEx
+            } finally {
+                if (socket != null) {
+                    try { socket.close() } catch (Exception ignored) {}
+                }
+            }
+
+            // Test 3: HTTPS Connection
+            logger.info("🔍 Test 3: HTTPS Connection...")
+            try {
+                def conn = (javax.net.ssl.HttpsURLConnection) url.openConnection()
+                conn.setConnectTimeout(10000)
+                conn.setReadTimeout(10000)
+                conn.setRequestMethod("GET")
+
+                def responseCode = conn.getResponseCode()
+                logger.info("   ✅ HTTPS connection SUCCESS - Response Code: {}", responseCode)
+            } catch (Exception httpsEx) {
+                logger.warn("   ⚠️ HTTPS test warning: {}", httpsEx.message)
+                logger.warn("      This may be normal if the endpoint requires authentication")
+                // Don't throw - some endpoints may require auth
+            }
+
+            logger.info("========================================")
+            logger.info("✅ Connectivity tests PASSED")
+            logger.info("========================================")
+
+        } catch (Exception e) {
+            logger.error("========================================")
+            logger.error("❌ Connectivity tests FAILED")
+            logger.error("========================================")
+            logger.error("Error: {}", e.message)
+            throw new RuntimeException("Cannot connect to endpoint: ${endpoint}", e)
+        }
     }
 
     /**
@@ -119,15 +298,33 @@ class CosmosNoSqlTestUtils {
             if (database == null || !database.getId().equals(databaseId)) {
                 logger.info("Creating or getting database: {}", databaseId)
                 def client = createClient()
-                database = client.createDatabaseIfNotExists(databaseId,
+
+                logger.info("📡 Attempting to create/get database '{}'...", databaseId)
+                client.createDatabaseIfNotExists(databaseId,
                     ThroughputProperties.createManualThroughput(throughput)
-                ).getDatabase(databaseId)
+                )
+                database = client.getDatabase(databaseId)
                 logger.info("✅ Database '{}' ready", databaseId)
             }
             return database
         } catch (Exception e) {
-            logger.error("❌ Failed to create/get database: {}", databaseId, e)
-            throw new RuntimeException("Failed to create/get database", e)
+            logger.error("❌ Failed to create/get database: {}", databaseId)
+            logger.error("   Error: {}", e.class.name)
+            logger.error("   Message: {}", e.message)
+            logger.error("   This may indicate the client is not properly connected to the emulator")
+
+            // Try to provide helpful diagnostics
+            if (e.message?.contains("timed out")) {
+                logger.error("   → Timeout: Emulator may not be responding")
+                logger.error("   → Try waiting longer for emulator to initialize")
+            } else if (e.message?.contains("Connection refused")) {
+                logger.error("   → Connection refused: Port may not be open")
+                logger.error("   → Check if emulator is running on the expected port")
+            } else if (e.message?.contains("Unauthorized")) {
+                logger.error("   → Unauthorized: Check your endpoint and key")
+            }
+
+            throw new RuntimeException("Failed to create/get database: ${e.message}", e)
         }
     }
 
@@ -145,6 +342,7 @@ class CosmosNoSqlTestUtils {
                 logger.info("Creating or getting container: {} in database: {}", containerId, databaseId)
                 def db = getOrCreateDatabase(databaseId)
 
+                logger.info("📡 Attempting to create/get container '{}' with partition key '{}'...", containerId, partitionKeyPath)
                 def containerProperties = new CosmosContainerProperties(
                     containerId,
                     partitionKeyPath
@@ -155,8 +353,20 @@ class CosmosNoSqlTestUtils {
             }
             return container
         } catch (Exception e) {
-            logger.error("❌ Failed to create/get container: {}", containerId, e)
-            throw new RuntimeException("Failed to create/get container", e)
+            logger.error("❌ Failed to create/get container: {}", containerId)
+            logger.error("   Database: {}", databaseId)
+            logger.error("   Error Type: {}", e.class.name)
+            logger.error("   Error Message: {}", e.message)
+
+            if (e.message?.contains("Forbidden")) {
+                logger.error("   → Forbidden: Check that the key is valid and has sufficient permissions")
+            } else if (e.message?.contains("timed out")) {
+                logger.error("   → Timeout: The operation took too long, emulator may be slow")
+            } else if (e.message?.contains("NotFound")) {
+                logger.error("   → Database not found: Try creating the database first")
+            }
+
+            throw new RuntimeException("Failed to create/get container: ${e.message}", e)
         }
     }
 
@@ -240,7 +450,8 @@ class CosmosNoSqlTestUtils {
         try {
             logger.info("Deleting document {} from {}.{}", documentId, databaseId, containerId)
             def container = getOrCreateContainer(databaseId, containerId)
-            container.deleteItem(documentId, new PartitionKey(partitionKeyValue))
+            def requestOptions = new CosmosItemRequestOptions()
+            container.deleteItem(documentId, requestOptions)
             logger.info("✅ Document deleted successfully")
         } catch (Exception e) {
             logger.error("❌ Failed to delete document: {}", documentId, e)
@@ -262,7 +473,7 @@ class CosmosNoSqlTestUtils {
             def container = getOrCreateContainer(databaseId, containerId)
             def queryOptions = new CosmosQueryRequestOptions()
             CosmosPagedIterable<Object> results = container.queryItems(sqlQuery, queryOptions, Object.class)
-            def resultList = results.stream().collect(java.util.stream.Collectors.toList())
+            def resultList = results.stream().collect(Collectors.toList())
             logger.info("✅ Query executed successfully, returned {} documents", resultList.size())
             return resultList
         } catch (Exception e) {

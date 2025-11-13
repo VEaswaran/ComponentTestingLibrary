@@ -144,19 +144,20 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
                     .withNetwork(cosmosNetwork)
                     .withNetworkAliases("cosmos-nosql")
                     .withEnv("COSMOS_DB_EMULATOR_PARTITION_COUNT", "1")
-                    .withEnv("AZURE_COSMOS_EMULATOR_ENABLE_DATA_explorer", "true")
-                    .withEnv("COSMOS_DB_EMULATOR_PARTITION_COUNT", "1")
+                    .withEnv("AZURE_COSMOS_EMULATOR_ENABLE_DATA_EXPLORER", "true")
                     .withExposedPorts(8081, 10251, 10252, 10253, 10254, 10255, 10256)
-                    .withStartupTimeout(Duration.ofSeconds(180))
+                    .withStartupTimeout(Duration.ofSeconds(300))
                     .withCreateContainerCmdModifier { cmd ->
                         // Configure container with proper settings for Cosmos Emulator
                         cmd.getHostConfig()
-                            .withMemory(3_072_000_000L)  // 3GB memory
-                            .withCpuCount(2L)             // 2 CPUs
-                            .withMemorySwap(3_072_000_000L)
+                            .withMemory(4_000_000_000L)   // 4GB memory (minimum for Cosmos)
+                            .withCpuCount(2L)              // 2 CPUs
+                            .withMemorySwap(4_000_000_000L)
+                            .withPrivileged(true)          // Required for emulator on some hosts
                     }
-                    .waitingFor(Wait.forLogMessage(".*Emulator.*successfully.*", 1)
-                            .withStartupTimeout(Duration.ofSeconds(180))
+                    .waitingFor(
+                        Wait.forLogMessage(".*Emulator.*successfully.*|.*listening.*", 1)
+                            .withStartupTimeout(Duration.ofSeconds(240))
                     )
 
             println "📦 Container configured. Starting..."
@@ -164,16 +165,25 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
             println "✅ Container started"
 
             // Get the endpoint and key
-            def host = cosmosContainer.getHost()
+            def rawHost = cosmosContainer.getHost()
             def port = cosmosContainer.getMappedPort(8081)
 
-            // On Windows with Docker Desktop, use localhost for external connections
+            // On Windows with Docker Desktop, use 127.0.0.1 for external connections
+            // getHost() may return Docker internal hostname which won't resolve correctly
+            def host = "127.0.0.1"
+
+            // Only use getHost() if it's a valid IP or localhost
+            if (rawHost != null && (rawHost.contains(".") || rawHost.equals("localhost"))) {
+                host = rawHost
+            }
+
             // The mapped port is the correct way to access the container
             cosmosEndpoint = "https://${host}:${port}"
             cosmosKey = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTjchw5LvMR0CNLio7QA/5DB/TcxwKeVw=="
 
             println "✅ Cosmos DB Emulator container started successfully"
-            println "   📍 Host: ${host}"
+            println "   📍 Raw Host (from container): ${rawHost}"
+            println "   📍 Resolved Host: ${host}"
             println "   🔌 Mapped Port (External): ${port}"
             println "   🌐 Endpoint: ${cosmosEndpoint}"
             println "   📌 Internal Container Port: 8081"
@@ -190,8 +200,8 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
             println "✅ Port mapping verified: 8081 -> ${port}"
 
             // Wait for Cosmos DB to be fully ready
-            println "⏳ Waiting for Cosmos DB Emulator to be fully initialized (45 seconds)..."
-            Thread.sleep(45000)
+            println "⏳ Waiting for Cosmos DB Emulator to be fully initialized (60 seconds)..."
+            Thread.sleep(60000)
 
             // Verify Cosmos DB is running
             println "🔍 Verifying Cosmos DB Emulator container status..."
@@ -225,6 +235,9 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
             // Print stack trace for debugging
             println "\n🔍 STACK TRACE:"
             e.printStackTrace()
+
+            // Print Docker diagnostics
+            printDockerDiagnostics()
 
             // Try to get container logs
             if (cosmosContainer != null && cosmosContainer.isRunning()) {
@@ -309,13 +322,40 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
             } else {
                 println "📥 Pulling Cosmos DB Emulator image (this may take 5-15 minutes)..."
                 println "   Full image: ${fullImageName}"
+
+                // Try to login to MCR first (no credentials needed for public images)
+                println "🔐 Attempting to login to MCR (mcr.microsoft.com)..."
+                try {
+                    def loginProcess = "docker login -u 00000000-0000-0000-0000-000000000000 --password-stdin mcr.microsoft.com".execute()
+                    loginProcess.getOutputStream().write("\n".getBytes())
+                    loginProcess.getOutputStream().close()
+                    loginProcess.waitFor()
+                    // Login failure is not critical - MCR public images don't need auth
+                    if (loginProcess.exitValue() == 0) {
+                        println "✅ MCR login successful"
+                    } else {
+                        println "ℹ️ MCR login not required for public images"
+                    }
+                } catch (Exception ignored) {
+                    println "ℹ️ MCR login skipped (public images don't require authentication)"
+                }
+
+                // Pull the image
+                println "📦 Pulling image..."
                 def pullProcess = "docker pull ${fullImageName}".execute()
 
                 // Capture output in real-time
                 def pullOutput = new StringBuilder()
+                def pullError = new StringBuilder()
+
                 pullProcess.inputStream.eachLine { line ->
                     println "   ${line}"
                     pullOutput.append(line).append("\n")
+                }
+
+                pullProcess.errorStream.eachLine { line ->
+                    println "   ⚠️ ${line}"
+                    pullError.append(line).append("\n")
                 }
 
                 pullProcess.waitFor()
@@ -324,15 +364,67 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
                     println "✅ Image pulled successfully"
                 } else {
                     println "⚠️ Warning: Image pull returned exit code ${pullProcess.exitValue()}"
-                    println "   Output: ${pullOutput.toString()}"
-                    // Continue anyway - image might be pre-cached
+
+                    // Check if it's a credential error
+                    def errorMsg = pullError.toString() + pullOutput.toString()
+                    if (errorMsg.contains("credential") || errorMsg.contains("unauthorized") || errorMsg.contains("authentication")) {
+                        println "ℹ️ Note: Credential error detected, but MCR public images don't need authentication"
+                        println "   Docker may retry automatically, or the image may already be cached"
+                        println "   Proceeding with Testcontainers pull as fallback..."
+                    } else {
+                        println "   Output: ${pullOutput.toString()}"
+                    }
+                    // Continue anyway - Testcontainers will attempt to pull automatically
                 }
             }
         } catch (Exception e) {
             println "⚠️ Warning: Could not verify/pull Cosmos DB image"
             println "   Error: ${e.message}"
-            println "   Attempting to continue anyway..."
+            println "   Note: Testcontainers will attempt to pull the image automatically"
+            println "   If you continue to see credential errors:"
+            println "   - The image may be cached locally already"
+            println "   - Docker Desktop may need to be restarted"
+            println "   - Check: docker images | grep cosmosdb"
             // Don't throw - let Testcontainers attempt to pull automatically
+        }
+    }
+
+    /**
+     * Print detailed Docker and container diagnostics for troubleshooting
+     */
+    private static void printDockerDiagnostics(String containerName = "cosmos-nosql") {
+        println "\n📋 DOCKER DIAGNOSTICS:"
+        try {
+            println "   🔍 Running: docker ps -a"
+            def psProcess = "docker ps -a".execute()
+            psProcess.waitFor()
+            println psProcess.text
+        } catch (Exception e) {
+            println "   ❌ Could not run docker ps: ${e.message}"
+        }
+
+        try {
+            println "   🔍 Running: docker inspect (looking for our container)"
+            def inspectProcess = "docker ps -a --format '{{.Names}}\\t{{.Ports}}\\t{{.Status}}'".execute()
+            inspectProcess.waitFor()
+            println inspectProcess.text
+        } catch (Exception e) {
+            println "   ❌ Could not run docker inspect: ${e.message}"
+        }
+
+        if (cosmosContainer != null) {
+            try {
+                println "   🔍 Container ID: ${cosmosContainer.containerId}"
+                println "   🔍 Container Port 8081 mapped to: ${cosmosContainer.getMappedPort(8081)}"
+                println "   🔍 Container running: ${cosmosContainer.isRunning()}"
+                println "   🔍 Container logs (last 50 lines):"
+                def allLogs = cosmosContainer.getLogs()
+                def lines = allLogs.split('\n')
+                def lastLines = lines.length > 50 ? lines[-50..-1] : lines
+                lastLines.each { println "        $it" }
+            } catch (Exception e) {
+                println "   ❌ Error getting container info: ${e.message}"
+            }
         }
     }
 
@@ -379,6 +471,16 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
         println "   🔄 Starting Cosmos DB health check with max ${maxRetries} retries..."
         println "   📍 Testing endpoint: ${cosmosEndpoint}"
         println "   🔑 Using key: ${cosmosKey.take(10)}..."
+
+        // First, test basic connectivity
+        println "\n   🔍 Step 1: Testing basic network connectivity..."
+        try {
+            cosmosNoSqlUtils.testConnectivity()
+            println "   ✅ Network connectivity verified"
+        } catch (Exception connectEx) {
+            println "   ⚠️ Network connectivity test failed (non-fatal at this stage)"
+            println "      Error: ${connectEx.message}"
+        }
 
         while (retryCount < maxRetries) {
             try {
@@ -501,23 +603,38 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
 
             // Extract host and port
             def host = url.host
-            def port = url.port == -1 ? 443 : url.port
+            def port = url.port == -1 ? 8081 : url.port
 
-            println "   📍 Resolved: host=${host}, port=${port}"
+            println "   📍 Parsed: host=${host}, port=${port}"
 
-            // Try socket connection first (quick check)
-            println "   🔗 Testing socket connection..."
+            // Try socket connection first (quick check) with detailed diagnostics
+            println "   🔗 Testing socket connection to ${host}:${port}..."
             def socket = new Socket()
-            socket.connect(new java.net.InetSocketAddress(host, port), 5000)
-            socket.close()
-
-            println "   ✅ Socket connection successful"
+            try {
+                socket.connect(new java.net.InetSocketAddress(host, port), 10000)
+                println "   ✅ Socket connection successful to ${host}:${port}"
+                socket.close()
+            } catch (Exception se) {
+                println "   ❌ Socket connection failed: ${se.class.simpleName}: ${se.message}"
+                println "      Endpoint: ${endpoint}"
+                println "      Host: ${host}"
+                println "      Port: ${port}"
+                println "      This may indicate:"
+                println "      - Container not listening on port ${port}"
+                println "      - Firewall blocking connection"
+                println "      - Port mapping not correctly established"
+                println "      - Container may have crashed during startup"
+                try {
+                    socket.close()
+                } catch (Exception ignored) {}
+                throw se
+            }
 
             // Try HTTPS connection
             println "   🔒 Testing HTTPS connection..."
             def conn = (HttpsURLConnection) url.openConnection()
-            conn.setConnectTimeout(5000)
-            conn.setReadTimeout(5000)
+            conn.setConnectTimeout(10000)
+            conn.setReadTimeout(10000)
             conn.setRequestMethod("GET")
 
             def responseCode = conn.getResponseCode()
@@ -528,13 +645,16 @@ abstract class IntegrationTestBaseCosmosNoSqlSpec extends Specification {
             println "   ❌ Connection refused: ${e.message}"
             println "      This usually means the container is not listening on the port"
             println "      or there's a firewall blocking the connection"
+            println "      Endpoint: ${endpoint}"
             throw e
         } catch (SocketTimeoutException e) {
             println "   ❌ Connection timeout: ${e.message}"
-            println "      The endpoint is not responding within 5 seconds"
+            println "      The endpoint is not responding within 10 seconds"
+            println "      Endpoint: ${endpoint}"
             throw e
         } catch (Exception e) {
             println "   ⚠️ Warning: Could not verify connectivity: ${e.class.simpleName}: ${e.message}"
+            println "      Endpoint: ${endpoint}"
             // Don't throw - might be expected for some connection scenarios
         }
     }

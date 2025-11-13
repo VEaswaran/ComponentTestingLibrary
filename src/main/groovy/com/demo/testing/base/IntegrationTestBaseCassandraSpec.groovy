@@ -2,6 +2,7 @@ package com.demo.testing.base
 
 import com.demo.testing.utils.CassandraTestUtils
 import com.demo.testing.utils.CosmosCassandraTestUtils
+import com.demo.testing.utils.WireMockTestUtils
 import org.springframework.test.context.DynamicPropertyRegistry
 import org.springframework.test.context.DynamicPropertySource
 import org.testcontainers.containers.CassandraContainer
@@ -15,17 +16,18 @@ import java.net.Socket
 import java.net.InetSocketAddress
 
 /**
- * Base specification for integration tests that require Cassandra and Cosmos Cassandra databases.
+ * Base specification for integration tests that require Cassandra, Cosmos Cassandra, and WireMock.
  *
  * Features:
- * - Automatically starts both Cassandra and Cosmos Cassandra using Testcontainers
+ * - Automatically starts Cassandra, Cosmos Cassandra, and WireMock using Testcontainers
  * - Provides cassandraUtils for Cassandra operations
  * - Provides cosmosCassandraUtils for Cosmos Cassandra operations
- * - Configures Spring Boot with Cassandra connection properties
- * - Shares database clients across all test methods in the spec
+ * - Provides wireMockUtils for WireMock mock server operations
+ * - Configures Spring Boot with Cassandra and WireMock connection properties
+ * - Shares database clients and mock server across all test methods in the spec
  * - Properly integrates with Spring's test context for autowiring
  * - Containers are automatically stopped after tests complete
- * - Both databases run on a shared Docker network for isolated testing
+ * - All containers run on a shared Docker network for isolated testing
  *
  * Prerequisites:
  * - Docker must be installed and running
@@ -33,8 +35,9 @@ import java.net.InetSocketAddress
  *
  * Usage:
  * class MyIntegrationTest extends IntegrationTestBaseCassandraSpec {
- *     def "test cassandra operations"() {
+ *     def "test cassandra and mock operations"() {
  *         when:
+ *         wireMockUtils.stubGetEndpoint("/api/test", '{"result":"ok"}', 200)
  *         cassandraUtils.executeQuery("SELECT * FROM system.local")
  *
  *         then:
@@ -70,6 +73,16 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
 
     @Shared
     protected static Network cassandraNetwork
+
+    // WireMock
+    @Shared
+    protected static GenericContainer wireMockContainer
+    @Shared
+    protected static WireMockTestUtils wireMockUtils
+    @Shared
+    protected static String wireMockUrl
+    @Shared
+    protected static int wireMockPort
 
     static {
         // Static initializer block - runs BEFORE anything else
@@ -163,6 +176,43 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
             cosmosCassandraUtils = new CosmosCassandraTestUtils(cosmosCassandraContactPoint, cosmosCassandraPort)
             println "✅ cosmosCassandraUtils initialized with: ${cosmosCassandraContactPoint}:${cosmosCassandraPort}"
 
+            // Start WireMock
+            println "\n📦 Starting WireMock container..."
+            wireMockContainer = new GenericContainer(DockerImageName.parse("wiremock/wiremock:3.1.0"))
+                    .withNetwork(cassandraNetwork)
+                    .withNetworkAliases("wiremock")
+                    .withExposedPorts(8080)
+                    .withStartupTimeout(Duration.ofSeconds(60))
+
+            wireMockContainer.start()
+            wireMockUrl = "http://" + wireMockContainer.getHost()
+            wireMockPort = wireMockContainer.getMappedPort(8080)
+
+            println "✅ WireMock container started successfully"
+            println "   📍 URL: ${wireMockUrl}"
+            println "   🔌 Port: ${wireMockPort}"
+            println "   🌐 Full URL: ${wireMockUrl}:${wireMockPort}"
+
+            // Wait for WireMock to be fully ready
+            println "⏳ Waiting for WireMock to be fully initialized (5 seconds)..."
+            Thread.sleep(5000)
+
+            // Verify WireMock is running
+            println "🔍 Verifying WireMock container status..."
+            def wireMockRunning = wireMockContainer.isRunning()
+            if (!wireMockRunning) {
+                println "❌ CRITICAL: WireMock container is NOT running!"
+                def logs = wireMockContainer.getLogs()
+                println "📋 WireMock container logs:"
+                println logs
+                throw new RuntimeException("WireMock container stopped immediately after startup. Check logs above.")
+            }
+            println "✅ WireMock container is running"
+
+            // Initialize wireMockUtils
+            wireMockUtils = new WireMockTestUtils(wireMockUrl, wireMockPort)
+            println "✅ wireMockUtils initialized with: ${wireMockUrl}:${wireMockPort}"
+
             println "\n==============================================\n"
 
         } catch (Exception e) {
@@ -175,7 +225,7 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
     }
 
     /**
-     * Verify Cassandra and Cosmos Cassandra are running in setupSpec
+     * Verify Cassandra, Cosmos Cassandra, and WireMock are running in setupSpec
      */
     def setupSpec() {
         println "\n=== setupSpec for: ${getClass().simpleName} ==="
@@ -200,17 +250,26 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
             throw new IllegalStateException("cosmosCassandraUtils is null - static initialization failed!")
         }
 
+        if (wireMockUtils == null) {
+            println "❌ ERROR: wireMockUtils is NULL!"
+            throw new IllegalStateException("wireMockUtils is null - static initialization failed!")
+        }
+
         println "✅ Testcontainers-managed Cassandra instance ready"
         println "   📍 Cassandra: ${cassandraContactPoint}:${cassandraPort}"
         println "✅ Testcontainers-managed Cosmos Cassandra instance ready"
         println "   📍 Cosmos Cassandra: ${cosmosCassandraContactPoint}:${cosmosCassandraPort}"
+        println "✅ Testcontainers-managed WireMock instance ready"
+        println "   📍 WireMock: ${wireMockUrl}:${wireMockPort}"
         println "✅ cassandraUtils: ${cassandraUtils}"
         println "✅ cosmosCassandraUtils: ${cosmosCassandraUtils}"
+        println "✅ wireMockUtils: ${wireMockUtils}"
 
-        // Verify both Cassandra instances are ready
-        println "🔍 Verifying both Cassandra instances readiness..."
+        // Verify all instances are ready
+        println "🔍 Verifying all services readiness..."
         verifyCassandraReady()
         verifyCosmosReady()
+        verifyWireMockReady()
 
         println "✅ Ready to run tests"
     }
@@ -284,7 +343,41 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
     }
 
     /**
-     * Cleanup after tests - automatically stops both Cassandra containers
+     * Verify that WireMock is fully initialized and ready to accept connections
+     */
+    private void verifyWireMockReady() {
+        def maxRetries = 30
+        def retryCount = 0
+
+        println "   🔄 Starting WireMock health check with max ${maxRetries} retries..."
+
+        while (retryCount < maxRetries) {
+            try {
+                println "   📡 Checking WireMock connectivity (attempt $retryCount/$maxRetries)..."
+                def socket = new Socket()
+                def address = new InetSocketAddress(wireMockContainer.getHost(), wireMockPort)
+                socket.connect(address, 5000)
+                socket.close()
+
+                println "✅ WireMock is ready: ${wireMockUrl}:${wireMockPort}"
+                return  // Success - exit method
+            } catch (Exception e) {
+                retryCount++
+                if (retryCount < maxRetries) {
+                    println "   ⏳ WireMock not ready yet (${e.class.simpleName})"
+                    println "      Retry attempt $retryCount/$maxRetries..."
+                    Thread.sleep(2000)  // Wait 2 seconds between retries
+                } else {
+                    println "❌ WireMock failed to become ready after $maxRetries attempts"
+                    println "❌ Last error: ${e.class.simpleName}: ${e.message}"
+                    throw new RuntimeException("WireMock not ready after $maxRetries attempts: ${e.message}", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Cleanup after tests - automatically stops Cassandra, Cosmos Cassandra, and WireMock containers
      */
     def cleanupSpec() {
         println "\n=== cleanupSpec for: ${getClass().simpleName} ==="
@@ -298,6 +391,11 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
                 println "🛑 Stopping Cosmos Cassandra container..."
                 cosmosCassandraContainer.stop()
                 println "✅ Cosmos Cassandra container stopped"
+            }
+            if (wireMockContainer != null) {
+                println "🛑 Stopping WireMock container..."
+                wireMockContainer.stop()
+                println "✅ WireMock container stopped"
             }
             if (cassandraNetwork != null) {
                 println "🛑 Closing Cassandra network..."
@@ -313,7 +411,7 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
     }
 
     /**
-     * Dynamically inject Cassandra properties into Spring context
+     * Dynamically inject Cassandra and WireMock properties into Spring context
      * This method is called by Spring BEFORE the application context is created
      */
     @DynamicPropertySource
@@ -330,10 +428,11 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
             throw new IllegalStateException("Cosmos Cassandra contactPoint is null - static initialization failed!")
         }
 
-        println "✅ Registering Cassandra properties with Spring"
+        println "✅ Registering Cassandra, Cosmos Cassandra, and WireMock properties with Spring"
         println "   - Cassandra contact point: ${cassandraContactPoint}:${cassandraPort}"
         println "   - Cosmos Cassandra contact point: ${cosmosCassandraContactPoint}:${cosmosCassandraPort}"
-        println "   - Using Testcontainers-managed Cassandra instances"
+        println "   - WireMock URL: ${wireMockUrl}:${wireMockPort}"
+        println "   - Using Testcontainers-managed instances"
 
         // Cassandra properties
         registry.add("spring.cassandra.contact-points") { cassandraContactPoint }
@@ -347,7 +446,12 @@ abstract class IntegrationTestBaseCassandraSpec extends Specification {
         registry.add("spring.cosmos.cassandra.local-datacenter") { "cosmos-dc" }
         registry.add("spring.cosmos.cassandra.keyspace-name") { "cosmos_keyspace" }
 
-        println "✅ Cassandra properties registered successfully"
+        // WireMock properties
+        registry.add("wiremock.url") { wireMockUrl }
+        registry.add("wiremock.port") { wireMockPort.toString() }
+        registry.add("wiremock.base-url") { "${wireMockUrl}:${wireMockPort}" }
+
+        println "✅ Cassandra, Cosmos Cassandra, and WireMock properties registered successfully"
     }
 }
 
